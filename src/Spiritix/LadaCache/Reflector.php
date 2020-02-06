@@ -95,6 +95,46 @@ class Reflector
     }
 
     /**
+     * Use the PHP SQL Parser (if exists) to parse the table name from raw queries
+     *
+     * @param string $query
+     * @param array $tables
+     * @throws \Exception
+     */
+    public function getTablesFromRaw($query, &$tables) {
+        if (!class_exists('PHPSQLParser\PHPSQLParser')) {
+            return;
+        }
+        if (preg_match('#^\(#', $query)) {
+            $query = 'SELECT * FROM ' . $query;
+        }
+        $parsed = new \PHPSQLParser\PHPSQLParser($query);
+        $this->loopParsedTree($parsed->parsed, $tables);
+    }
+
+    /**
+     * @param \PHPSQLParser\PHPSQLParser $parsed
+     * @param array $tables
+     * @throws \Exception
+     */
+    public function loopParsedTree($parsed, &$tables) {
+        if (isset($parsed['FROM']) && count($parsed['FROM'])) {
+            foreach($parsed['FROM'] as $from) {
+                if ($from['expr_type'] == 'subquery') {
+                    $this->loopParsedTree($from['sub_tree'], $tables);
+                } else if ($from['expr_type'] == 'table') {
+                    $from['table'] = str_replace('`', '', $from['table']);
+                    if (!in_array($from['table'], $tables)) {
+                        $tables[] = $from['table'];
+                    }
+                } else {
+                    throw new \Exception('Expression type not supported');
+                }
+            }
+        }
+    }
+
+    /**
      * Returns all affected tables, including joined ones.
      *
      * @return array
@@ -102,19 +142,27 @@ class Reflector
     public function getTables()
     {
         // Get main table
-        $tables = [$this->queryBuilder->from];
+        $tables = [];
+        if (is_string($this->queryBuilder->from)) {
+            $tables[] = trim(preg_replace('#[\s]+(AS[\s]+)[\w\.]+#i', '', $this->queryBuilder->from));
+        } else {
+            $this->getTablesFromRaw($this->queryBuilder->from, $tables);
+        }
 
         // Add possible join tables
         $joins = $this->queryBuilder->joins ?: [];
         foreach ($joins as $join) {
-
             if (!in_array($join->table, $tables) && is_string($join->table)) {
-                $tables[] = $join->table;
+                if (!in_array($this->queryBuilder->from, ['users', 'roles'])) {
+                    //dd($this->queryBuilder->from, $joins);
+                }
+                $tables[] = trim(preg_replace('#[\s]+(AS[\s]+)[\w\.]+#i', '', $join->table));
+            } else {
+                $this->getTablesFromRaw($join->table, $tables);
             }
         }
 
         $this->getTablesFromWhere($this->queryBuilder, $tables);
-
         return $tables;
     }
 
@@ -130,14 +178,20 @@ class Reflector
         $wheres = $queryBuilder->wheres ?: [];
         foreach ($wheres as $where) {
             if ($where['type'] == 'Exists' || $where['type'] == 'NotExists') {
-                $tables[] = $where['query']->from;
+                $table = trim(preg_replace('#[\s]+(AS[\s]+)[\w\.]+#i', '', $where['query']->from));
+                if (!in_array($table, $tables) && is_string($table)) {
+                    $tables[] = $table;
+                } else {
+                    $this->getTablesFromRaw($table, $tables);
+                }
 
                 // Add possible join tables
                 $joins = $where['query']->joins ?: [];
                 foreach ($joins as $join) {
-
                     if (!in_array($join->table, $tables) && is_string($join->table)) {
-                        $tables[] = $join->table;
+                        $tables[] = trim(preg_replace('#[\s]+(AS[\s]+)[\w\.]+#i', '', $join->table));
+                    } else {
+                        $this->getTablesFromRaw($join->table, $tables);
                     }
                 }
             }
@@ -166,7 +220,7 @@ class Reflector
 
             // If it doesn't contain the table name assume it's the "FROM" table
             if (strpos($where['column'], '.') === false) {
-                $where['column'] = implode('.', [$this->queryBuilder->from, $where['column']]);
+                $where['column'] = implode('.', [trim(preg_replace('#[\s]+(AS[\s]+)[\w\.]+#i', '', $this->queryBuilder->from)), $where['column']]);
             }
 
             list($table, $column) = $this->splitTableAndColumn($where['column']);
